@@ -1,36 +1,24 @@
-# Stage 1: Compute a recipe file
-FROM lukemathwalker/cargo-chef:latest-rust-1.83-alpine AS planner
-WORKDIR /app
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-# Stage 2: Cache dependencies
-FROM lukemathwalker/cargo-chef:latest-rust-1.83-alpine AS cacher
-WORKDIR /app
-COPY --from=planner /app/recipe.json recipe.json
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
-
-# Stage 3: Build the actual binary
+# Stage 1: Build the binary
 FROM rust:1.83-alpine AS builder
 WORKDIR /app
-COPY . .
-# Copy over the cached dependencies from the cacher stage
-COPY --from=cacher /app/target /app/target
-COPY --from=cacher /usr/local/cargo /usr/local/cargo
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig binutils
+# Install build dependencies
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig binutils curl
 
-# Build for MUSL (Static linking)
-RUN cargo build --release --target x86_64-unknown-linux-musl
+# Copy source code
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 
-# Minify the binary
-RUN strip target/x86_64-unknown-linux-musl/release/rust-scraper
+# Build for the native target (supports both amd64 and arm64)
+RUN cargo build --release
 
-# Stage 4: Final minimal runtime
+# Strip the binary to minimize size
+RUN strip target/release/rust-scraper
+
+# Stage 2: Final minimal runtime
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates wget
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rust-scraper /usr/local/bin/rust-scraper
+RUN apk add --no-cache ca-certificates curl
+COPY --from=builder /app/target/release/rust-scraper /usr/local/bin/rust-scraper
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/rust-scraper"]
