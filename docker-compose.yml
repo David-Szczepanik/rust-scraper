@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # Rust Scraper Service
+  # ==========================================================================
+  rust-scraper:
+    build:
+      context: ./rust-scraper
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - PORT=3000
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # ==========================================================================
+  # Python Celery Worker
+  # ==========================================================================
+  python-worker:
+    build:
+      context: ./python-adiutor
+      dockerfile: Dockerfile
+    environment:
+      - RUST_SCRAPER_URL=http://rust-scraper:3000
+      - RUST_SCRAPER_TIMEOUT=300
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      rust-scraper:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+    command: celery -A app.celery_app worker --loglevel=info
+
+  # ==========================================================================
+  # Redis (Message Broker)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+    volumes:
+      - redis-data:/data
+
+  # ==========================================================================
+  # FastAPI Backend (Optional - if you have one)
+  # ==========================================================================
+  # api:
+  #   build:
+  #     context: ./python-adiutor
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - SUPABASE_URL=${SUPABASE_URL}
+  #     - SUPABASE_KEY=${SUPABASE_KEY}
+  #     - REDIS_URL=redis://redis:6379/0
+  #   depends_on:
+  #     - redis
+  #     - rust-scraper
+  #   networks:
+  #     - app-network
+  #   command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  redis-data:

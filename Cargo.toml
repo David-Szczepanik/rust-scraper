@@ -1,0 +1,40 @@
+[package]
+name = "rust-scraper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web Framework
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Async Runtime
+tokio = { version = "1.48", features = ["full"] }
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["cookies", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTML Parsing
+lol_html = "2.7"
+scraper = "0.24"
+
+# URL Parsing
+url = "2.5"
+
+# Environment Variables
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Supabase/Postgres
+postgrest = "1.6"
+
+# Date and Time
+chrono = "0.4"
+hash-ids = "0.3.1"
