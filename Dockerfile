@@ -1,18 +1,18 @@
 # Stage 1: Compute a recipe file
-FROM lukemathwalker/cargo-chef:latest-rust-1.81-alpine AS planner
+FROM lukemathwalker/cargo-chef:latest-rust-1.83-alpine AS planner
 WORKDIR /app
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cache dependencies
-FROM lukemathwalker/cargo-chef:latest-rust-1.81-alpine AS cacher
+FROM lukemathwalker/cargo-chef:latest-rust-1.83-alpine AS cacher
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
 # Stage 3: Build the actual binary
-FROM rust:1.81-alpine AS builder
+FROM rust:1.83-alpine AS builder
 WORKDIR /app
 COPY . .
 # Copy over the cached dependencies from the cacher stage
