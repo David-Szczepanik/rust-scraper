@@ -241,7 +241,10 @@ impl AppState {
             .or_else(|_| env::var("SUPABASE_ANON_KEY"))
             .or_else(|_| env::var("SUPABASE_KEY"));
 
-        let supabase_client = if let (Ok(url), Ok(key)) = (env::var("SUPABASE_URL"), supabase_key) {
+        let supabase_client = if let (Ok(mut url), Ok(key)) = (env::var("SUPABASE_URL"), supabase_key) {
+            if !url.ends_with("/rest/v1") && !url.ends_with("/rest/v1/") {
+                url = format!("{}/rest/v1/", url.trim_end_matches('/'));
+            }
             info!("Initializing Supabase client with URL: {}", url);
             Some(Arc::new(
                 Postgrest::new(url)

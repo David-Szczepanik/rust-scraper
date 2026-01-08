@@ -1,8 +1,10 @@
 name: 🚀 Build and Push Rust Scraper
 
+# manual trigger only since we build locally to save time/cost on ARM builders
 on:
-  push:
-    branches: [ main ]
+  workflow_dispatch:
+  # push:
+  #   branches: [ main ]
 
 env:
   REGISTRY: ghcr.io
@@ -10,7 +12,7 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
