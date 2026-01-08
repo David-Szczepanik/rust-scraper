@@ -5,11 +5,19 @@ WORKDIR /app
 # Install build dependencies
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig binutils curl
 
-# Copy source code
+# Create a dummy project and build dependencies to cache them
+RUN mkdir src && echo "fn main() {}" > src/main.rs
 COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release
+
+# Remove the dummy source and copy the actual source code
+RUN rm -rf src
 COPY src ./src
 
-# Build for the native target (supports both amd64 and arm64)
+# Touch the main file to ensure cargo rebuilds it
+RUN touch src/main.rs
+
+# Build the actual application
 RUN cargo build --release
 
 # Strip the binary to minimize size

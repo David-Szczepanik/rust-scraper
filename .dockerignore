@@ -1,0 +1,7 @@
+# Ignore local build artifacts and configuration
+target/
+.env
+.git
+.gitignore
+Dockerfile
+README.md
