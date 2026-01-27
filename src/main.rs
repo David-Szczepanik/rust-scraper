@@ -4,21 +4,51 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use lol_html::{element, text, HtmlRewriter, Settings};
 use postgrest::Postgrest;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::task;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-use url::Url;
 
-const BASE_URL: &str = "https://nalus.usoud.cz/Search";
+mod models;
+mod scrapers;
+
+use models::*;
+use scrapers::{scrape_nejvyssi, scrape_nejvyssi_spravni, scrape_ustavni};
+
+async fn upload_to_supabase(
+    client: &postgrest::Postgrest,
+    results: &[CaseResult],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+   // filter duplicates
+    let mut seen = std::collections::HashSet::new();
+    let db_cases: Vec<DbCase> = results
+        .iter()
+        .filter(|c| seen.insert(c.spisova_znacka.clone()))
+        .cloned()
+        .map(DbCase::from)
+        .collect();
+    let body = serde_json::to_string(&db_cases)?;
+
+    let resp = client
+        .from("judikatura")
+        .upsert(body)
+        .on_conflict("jud_id")
+        .execute()
+        .await
+        .map_err(|e| format!("Supabase request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Supabase error {}: {}", status, text).into());
+    }
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -40,55 +70,118 @@ async fn main() {
     };
 
     // check for DEBUG mode
-    let debug_mode = env::var("DEBUG").unwrap_or_else(|_| "1".to_string()) == "0";
-
+    let debug_mode: bool = env::var("DEBUG") == Ok("1".to_string());
     if debug_mode {
         info!("Running in DEBUG mode - executing hardcoded search cases");
 
-        let debug_cases = vec![
-            "I. ÚS 823/11".to_string(),
-            "I. ÚS 1927/24".to_string(),
-            "I. ÚS 1933/24".to_string(),
-            "I. ÚS 367/03".to_string(),
-            "III. ÚS 358/14".to_string(),
-            "I. ÚS 3018/14".to_string(),
-        ];
-
         let payload = ScrapeRequest {
-            cases: debug_cases,
             task_id: "debug-task".to_string(),
+            ustavni: Some(vec!["I.ÚS 2956/23".to_string()]),
+            nejvyssi: Some(vec!["3 Tdo 706/2024".to_string()]),
+            nejvyssi_spravni: Some(vec!["1 As 112/2024".to_string(), "10 As 222/2024".to_string(), "9 As 211/2022".to_string()]),
+            debug_mode: Some(true),
         };
 
-        let mut handles = vec![];
 
-        for case_number in payload.cases.clone() {
-            let state_clone = state.clone();
+        let mut handles: Vec<task::JoinHandle<Result<CaseResult, (String, String)>>> = vec![];
+
+        let mut tasks: Vec<(String, String)> = vec![];
+        if let Some(cases) = &payload.ustavni {
+            for c in cases { tasks.push((c.clone(), "ustavni".to_string())); }
+        }
+        if let Some(cases) = &payload.nejvyssi {
+            for c in cases { tasks.push((c.clone(), "nejvyssi".to_string())); }
+        }
+        if let Some(cases) = &payload.nejvyssi_spravni {
+            for c in cases { tasks.push((c.clone(), "nejvyssi_spravni".to_string())); }
+        }
+
+        for (case_number, court_type) in &tasks {
             let case = case_number.clone();
-
+            let court = court_type.clone();
             let handle = task::spawn(async move {
-                match scrape_case(&state_clone.http_client, &case).await {
-                    Ok(result) => {
-                        info!("Successfully scraped: {}", result.spisova_znacka);
-                        Ok(result)
+                let client = create_client().expect("Failed to create client");
+                let result = match court.as_str() {
+                    "ustavni" => scrape_ustavni(&client, &case).await,
+                    "nejvyssi" => scrape_nejvyssi(&client, &case).await,
+                    "nejvyssi_spravni" => scrape_nejvyssi_spravni(&client, &case).await,
+                    _ => scrape_ustavni(&client, &case).await,
+                };
+                match result {
+                    Ok(res) => {
+                        info!("Successfully scraped ({}): {}", court, res.spisova_znacka);
+                        Ok(res)
                     }
                     Err(e) => {
-                        error!("Failed to scrape {}: {}", case, e);
-                        Err(case)
+                        error!("Failed to scrape {} ({}): {}", case, court, e);
+                        Err((case, e.to_string()))
                     }
                 }
             });
             handles.push(handle);
         }
 
-        let mut results = vec![];
-        let mut failed_cases = vec![];
+        let mut results: Vec<CaseResult> = vec![];
+        let mut failed_cases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         for handle in handles {
             match handle.await {
                 Ok(Ok(result)) => results.push(result),
-                Ok(Err(failed_case)) => failed_cases.push(failed_case),
+                Ok(Err((failed_case, error_msg))) => {
+                    failed_cases.insert(failed_case, error_msg);
+                }
                 Err(e) => {
                     error!("Task panicked: {}", e);
+                }
+            }
+        }
+
+        // Retry failed cases once
+        if !failed_cases.is_empty() {
+            info!("Retrying {} failed cases...", failed_cases.len());
+            let mut retry_handles: Vec<(String, task::JoinHandle<Result<CaseResult, (String, String)>>)> = vec![];
+
+            for (case_number, court_type) in &tasks {
+                if failed_cases.contains_key(case_number) {
+                    let case = case_number.clone();
+                    let court = court_type.clone();
+
+                    let handle = task::spawn(async move {
+                        let client = create_client().expect("Failed to create client");
+                        let result = match court.as_str() {
+                            "ustavni" => scrape_ustavni(&client, &case).await,
+                            "nejvyssi" => scrape_nejvyssi(&client, &case).await,
+                            "nejvyssi_spravni" => scrape_nejvyssi_spravni(&client, &case).await,
+                            _ => scrape_ustavni(&client, &case).await,
+                        };
+
+                        match result {
+                            Ok(res) => {
+                                info!("Retry successful ({}): {}", court, res.spisova_znacka);
+                                Ok(res)
+                            }
+                            Err(e) => {
+                                error!("Retry failed {} ({}): {}", case, court, e);
+                                Err((case, e.to_string()))
+                            }
+                        }
+                    });
+                    retry_handles.push((case_number.clone(), handle));
+                }
+            }
+
+            for (original_case, handle) in retry_handles {
+                match handle.await {
+                    Ok(Ok(result)) => {
+                        results.push(result);
+                        failed_cases.remove(&original_case);
+                    }
+                    Ok(Err((failed_case, error_msg))) => {
+                        failed_cases.insert(failed_case, error_msg);
+                    }
+                    Err(e) => {
+                        error!("Retry task panicked: {}", e);
+                    }
                 }
             }
         }
@@ -109,26 +202,22 @@ async fn main() {
             }
         }
 
-        for result in &results {
-            info!(
-                "Result: {} - {} - {}",
-                result.spisova_znacka, result.ecli, result.datum_rozhodnuti
-            );
-        }
+        let response: ScrapeResponse = ScrapeResponse {
+            task_id: payload.task_id.clone(),
+            scraped_count: results.len(),
+            results: results.iter().cloned().map(ScrapedCase::from).collect(),
+        };
 
-        if !failed_cases.is_empty() {
-            error!("Failed cases: {:?}", failed_cases);
-        }
-
-        let response = ScrapeResponse {
+        let log_data = ScrapeLog {
             success: failed_cases.is_empty(),
             task_id: payload.task_id,
-            results,
+            scraped_count: response.scraped_count,
+            results: results, // Use full results here
             failed_cases,
             message: "DEBUG mode completed".to_string(),
         };
 
-        if let Err(e) = save_log_file(&response) {
+        if let Err(e) = save_log_file(&log_data) {
             error!("Failed to save log file: {}", e);
         }
 
@@ -158,85 +247,21 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CaseResult {
-    pub spisova_znacka: String,
-    pub ecli: String,
-    pub datum_rozhodnuti: String,
-    pub popularni_nazev: String,
-    pub url_adresa: String,
-    pub abstrakt: String,
-    pub pravni_veta: String,
-    pub text_dokumentu: String,
-}
-
-use hash_ids::HashIds;
-
-// judikatura table
-#[derive(Serialize)]
-pub struct DbCase {
-    pub jud_id: String,
-    pub spisova_znacka: String,
-    pub ecli: String,
-    pub datum_rozhodnuti: String,
-    pub popularni_nazev: String,
-    pub url_adresa: String,
-    pub abstrakt: String,
-    pub pravni_veta: String,
-    pub text_dokumentu: String,
-}
-
-impl From<CaseResult> for DbCase {
-    fn from(c: CaseResult) -> Self {
-        Self {
-            jud_id: generate_jud_id(&c.spisova_znacka),
-            spisova_znacka: c.spisova_znacka,
-            ecli: c.ecli,
-            datum_rozhodnuti: c.datum_rozhodnuti,
-            popularni_nazev: c.popularni_nazev,
-            url_adresa: c.url_adresa,
-            abstrakt: c.abstrakt,
-            pravni_veta: c.pravni_veta,
-            text_dokumentu: c.text_dokumentu,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ScrapeRequest {
-    pub cases: Vec<String>,
-    pub task_id: String,
-}
-
-#[derive(Serialize)]
-pub struct ScrapeResponse {
-    pub success: bool,
-    pub task_id: String,
-    pub results: Vec<CaseResult>,
-    pub failed_cases: Vec<String>,
-    pub message: String,
-}
-
-#[derive(Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
-}
-
 #[derive(Clone)]
 pub struct AppState {
-    pub http_client: Client,
     pub supabase_client: Option<Arc<Postgrest>>,
+}
+
+fn create_client() -> Result<Client, String> {
+    Client::builder()
+        .cookie_store(true)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
 }
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        let http_client = Client::builder()
-            .cookie_store(true)
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
         let supabase_key = env::var("SUPABASE_SERVICE_ROLE_KEY")
             .or_else(|_| env::var("SUPABASE_ANON_KEY"))
             .or_else(|_| env::var("SUPABASE_KEY"));
@@ -257,7 +282,6 @@ impl AppState {
         };
 
         Ok(Self {
-            http_client,
             supabase_client,
         })
     }
@@ -274,43 +298,154 @@ async fn scrape_handler(
     State(state): State<AppState>,
     Json(payload): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<ScrapeResponse>) {
+    let is_debug: bool = payload.debug_mode.unwrap_or(false) || env::var("DEBUG") == Ok("1".to_string());
+
     info!(
-        "Received scrape request for {} cases, task_id: {}",
-        payload.cases.len(),
-        payload.task_id
+        "Received scrape request for task_id: {}, debug_mode: {}",
+        payload.task_id,
+        is_debug
     );
 
-    let mut handles = vec![];
+    info!(
+        "Received counts - Ustavni: {}, Nejvyssi: {}, Nejvyssi spravni: {}",
+        payload.ustavni.as_ref().map(|v| v.len()).unwrap_or(0),
+        payload.nejvyssi.as_ref().map(|v| v.len()).unwrap_or(0),
+        payload.nejvyssi_spravni.as_ref().map(|v| v.len()).unwrap_or(0)
+    );
 
-    // spawn concurrent scraping tasks
-    for case_number in payload.cases.clone() {
-        let state_clone = state.clone();
+    let mut tasks: Vec<(String, String)> = vec![];
+
+    // Helper to add cases for a specific court
+    let mut add_cases = |cases: &Option<Vec<String>>, court_type: &str| {
+        if let Some(c) = cases {
+            let mut list = c.clone();
+            if is_debug && !list.is_empty() {
+                list = vec![list[0].clone()];
+            }
+            for case in list {
+                tasks.push((case, court_type.to_string()));
+            }
+        }
+    };
+
+    add_cases(&payload.ustavni, "ustavni");
+    add_cases(&payload.nejvyssi, "nejvyssi");
+    add_cases(&payload.nejvyssi_spravni, "nejvyssi_spravni");
+
+    if tasks.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ScrapeResponse {
+                task_id: payload.task_id,
+                scraped_count: 0,
+                results: vec![],
+            }),
+        );
+    }
+
+    let mut handles: Vec<task::JoinHandle<Result<CaseResult, (String, String)>>> = vec![];
+
+    for (case_number, court_type) in &tasks {
+
         let case = case_number.clone();
+        let court = court_type.clone();
 
         let handle = task::spawn(async move {
-            match scrape_case(&state_clone.http_client, &case).await {
-                Ok(result) => {
-                    info!("Successfully scraped: {}", result.spisova_znacka);
-                    Ok(result)
+            let client = match create_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to create client: {}", e);
+                    return Err((case, e.to_string()));
+                }
+            };
+            let result = match court.as_str() {
+                "ustavni" => scrape_ustavni(&client, &case).await,
+                "nejvyssi" => scrape_nejvyssi(&client, &case).await,
+                "nejvyssi_spravni" => scrape_nejvyssi_spravni(&client, &case).await,
+                _ => scrape_ustavni(&client, &case).await, // fallback
+            };
+
+            match result {
+                Ok(res) => {
+                    info!("Successfully scraped ({}): {}", court, res.spisova_znacka);
+                    Ok(res)
                 }
                 Err(e) => {
-                    error!("Failed to scrape {}: {}", case, e);
-                    Err(case)
+                    error!("Failed to scrape {} ({}): {}", case, court, e);
+                    Err((case, e.to_string()))
                 }
             }
         });
         handles.push(handle);
     }
 
-    let mut results = vec![];
-    let mut failed_cases = vec![];
+    let mut results: Vec<CaseResult> = vec![];
+    let mut failed_cases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for handle in handles {
         match handle.await {
             Ok(Ok(result)) => results.push(result),
-            Ok(Err(failed_case)) => failed_cases.push(failed_case),
+            Ok(Err((failed_case, error_msg))) => {
+                failed_cases.insert(failed_case, error_msg);
+            }
             Err(e) => {
                 error!("Task panicked: {}", e);
+            }
+        }
+    }
+
+    // retry failed cases once
+    if !failed_cases.is_empty() {
+        info!("Retrying {} failed cases...", failed_cases.len());
+        let mut retry_handles: Vec<(String, task::JoinHandle<Result<CaseResult, (String, String)>>)> = vec![];
+
+        for (case_number, court_type) in &tasks {
+            if failed_cases.contains_key(case_number) {
+                let case = case_number.clone();
+                let court = court_type.clone();
+
+                let handle = task::spawn(async move {
+                    let client = match create_client() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Failed to create client: {}", e);
+                            return Err((case, e.to_string()));
+                        }
+                    };
+                    let result = match court.as_str() {
+                        "ustavni" => scrape_ustavni(&client, &case).await,
+                        "nejvyssi" => scrape_nejvyssi(&client, &case).await,
+                        "nejvyssi_spravni" => scrape_nejvyssi_spravni(&client, &case).await,
+                        _ => scrape_ustavni(&client, &case).await, // fallback
+                    };
+
+                    match result {
+                        Ok(res) => {
+                            info!("Retry successful ({}): {}", court, res.spisova_znacka);
+                            Ok(res)
+                        }
+                        Err(e) => {
+                            error!("Retry failed {} ({}): {}", case, court, e);
+                            Err((case, e.to_string()))
+                        }
+                    }
+                });
+                retry_handles.push((case_number.clone(), handle));
+            }
+        }
+
+        for (original_case, handle) in retry_handles {
+            match handle.await {
+                Ok(Ok(result)) => {
+                    results.push(result);
+                    failed_cases.remove(&original_case);
+                }
+                Ok(Err((failed_case, error_msg))) => {
+                    failed_cases.insert(failed_case, error_msg);
+                }
+                Err(e) => {
+                    error!("Retry task panicked: {}", e);
+                }
             }
         }
     }
@@ -337,26 +472,34 @@ async fn scrape_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     };
 
+    let failed_count = failed_cases.len();
     let response = ScrapeResponse {
-            success,
-            task_id: payload.task_id,
-            results,
-            failed_cases,
-            message: format!(
-                "Processed {} cases, {} failed",
-                processed_count,
-                payload.cases.len() - processed_count
-            ),
-        };
+        task_id: payload.task_id.clone(),
+        scraped_count: processed_count,
+        results: results.iter().cloned().map(ScrapedCase::from).collect(),
+    };
 
-    if let Err(e) = save_log_file(&response) {
+    let log_data = ScrapeLog {
+        success,
+        task_id: payload.task_id,
+        scraped_count: response.scraped_count,
+        results: results, // Use full results here
+        failed_cases,
+        message: format!(
+            "Processed {} cases, {} failed",
+            processed_count,
+            failed_count
+        ),
+    };
+
+    if let Err(e) = save_log_file(&log_data) {
         error!("Failed to save log file: {}", e);
     }
 
     (status, Json(response))
 }
 
-fn save_log_file(response: &ScrapeResponse) -> std::io::Result<()> {
+fn save_log_file(response: &ScrapeLog) -> std::io::Result<()> {
     use chrono::Local;
     use std::fs;
     use std::path::Path;
@@ -375,407 +518,4 @@ fn save_log_file(response: &ScrapeResponse) -> std::io::Result<()> {
 
     info!("Saved scrape log to {:?}", file_path);
     Ok(())
-}
-
-// scraping
-async fn scrape_case(
-    client: &Client,
-    search_query: &str,
-) -> Result<CaseResult, Box<dyn std::error::Error + Send + Sync>> {
-    let search_url = format!("{}/Search.aspx", BASE_URL);
-
-    // 1. fetch search page
-    let initial_html = client.get(&search_url).send().await?.text().await?;
-    let mut form_data = extract_hidden_fields(&initial_html)?;
-
-    // 2. submit search
-    form_data.insert(
-        "ctl00$MainContent$citace".to_string(),
-        search_query.to_string(),
-    );
-    form_data.insert("ctl00$MainContent$nalezy".to_string(), "on".to_string());
-    form_data.insert("ctl00$MainContent$usneseni".to_string(), "on".to_string());
-    form_data.insert(
-        "ctl00$MainContent$but_search".to_string(),
-        "Vyhledat".to_string(),
-    );
-
-    let response = client.post(&search_url).form(&form_data).send().await?;
-    let status = response.status();
-    let result_page_html = response.text().await?;
-    info!("Search request for '{}' returned status: {}, content length: {} bytes", search_query, status, result_page_html.len());
-
-    // 3. find detail link
-    let target_href = find_result_href(&result_page_html, search_query).ok_or_else(|| {
-        let msg = format!("Link not found for {}", search_query);
-        Box::<dyn std::error::Error + Send + Sync>::from(msg)
-    })?;
-
-    let detail_url = format!("{}/{}", BASE_URL, target_href);
-
-    // 4. fetch detail page
-    let detail_html = client.get(&detail_url).send().await?.text().await?;
-    let (ecli, datum, popularni_nazev) = extract_metadata(&detail_html);
-    let text_dokumentu = extract_document_text(&detail_html);
-
-    // 5. fetch Abstract separately if "ShowAbstrakt" button exists
-    let (abstrakt, pravni_veta) = if has_show_abstrakt(&detail_html) {
-        let parsed_url = Url::parse(&detail_url)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        let id_param = parsed_url
-            .query_pairs()
-            .find(|(k, _)| k == "id")
-            .map(|(_, v)| v.to_string())
-            .ok_or("Could not find 'id' parameter in detail URL")?;
-
-        let abstrakt_url = format!("{}/Abstrakt.aspx?id={}", BASE_URL, id_param);
-        let abstrakt_html = client.get(&abstrakt_url).send().await?.text().await?;
-
-        extract_abstrakt_content(&abstrakt_html)
-    } else {
-        (String::new(), String::new())
-    };
-
-    Ok(CaseResult {
-        spisova_znacka: search_query.to_string(),
-        ecli,
-        datum_rozhodnuti: datum,
-        popularni_nazev,
-        url_adresa: detail_url,
-        abstrakt,
-        pravni_veta,
-        text_dokumentu,
-    })
-}
-
-fn extract_document_text(html: &str) -> String {
-    let text = Arc::new(Mutex::new(String::new()));
-    let text_c = text.clone();
-    let text_br = text.clone();
-
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![
-                text!("#uc_vytah_cellContent", move |t| {
-                    text_c.lock().unwrap().push_str(t.as_str());
-                    Ok(())
-                }),
-                element!("#uc_vytah_cellContent br", move |_| {
-                    text_br.lock().unwrap().push_str("\n");
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    let _ = rewriter.write(html.as_bytes());
-    let _ = rewriter.end();
-
-    let result = text.lock().unwrap().trim().to_string();
-    result
-}
-
-fn generate_jud_id(spisova_znacka: &str) -> String {
-    let clean_znacka = spisova_znacka.trim();
-    info!(
-        "Looking for query: '{}'",
-        clean_znacka
-    );
-    let hasher = HashIds::builder()
-        .with_salt(clean_znacka)
-        .with_min_length(8)
-        .finish();
-    hasher.encode(&[1])
-}
-
-async fn upload_to_supabase(
-    client: &Postgrest,
-    results: &[CaseResult],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db_cases: Vec<DbCase> = results.iter().cloned().map(DbCase::from).collect();
-    let body = serde_json::to_string(&db_cases)?;
-
-    let resp = client
-        .from("judikatura")
-        .upsert(body)
-        .on_conflict("jud_id")
-        .execute()
-        .await
-        .map_err(|e| format!("Supabase request failed: {}", e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Supabase error {}: {}", status, text).into());
-    }
-
-    Ok(())
-}
-
-fn extract_hidden_fields(
-    html: &str,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
-    let values = Arc::new(Mutex::new(HashMap::new()));
-    let values_clone = values.clone();
-    let target_fields = [
-        "__VIEWSTATE",
-        "__EVENTVALIDATION",
-        "__VIEWSTATEGENERATOR",
-        "__PREVIOUSPAGE",
-    ];
-
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![element!("input[type=hidden]", move |el| {
-                if let Some(name) = el.get_attribute("name") {
-                    if target_fields.contains(&name.as_str()) {
-                        let value = el.get_attribute("value").unwrap_or_default();
-                        values_clone.lock().unwrap().insert(name, value);
-                    }
-                }
-                Ok(())
-            })],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    rewriter
-        .write(html.as_bytes())
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    rewriter
-        .end()
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-    let result = Arc::try_unwrap(values)
-        .map_err(|_| Box::<dyn std::error::Error + Send + Sync>::from("Failed to unwrap Arc"))?
-        .into_inner()
-        .map_err(|_| Box::<dyn std::error::Error + Send + Sync>::from("Failed to unlock Mutex"))?;
-    Ok(result)
-}
-
-fn find_result_href(html: &str, query: &str) -> Option<String> {
-    let candidates = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
-    let candidates_clone_el = candidates.clone();
-    let candidates_clone_text = candidates.clone();
-
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![
-                element!("a.resultData0", move |el| {
-                    let href = el.get_attribute("href").unwrap_or_default();
-                    candidates_clone_el
-                        .lock()
-                        .unwrap()
-                        .push((href, String::new()));
-                    Ok(())
-                }),
-                text!("a.resultData0", move |t| {
-                    if let Some(last) = candidates_clone_text.lock().unwrap().last_mut() {
-                        last.1.push_str(t.as_str());
-                    }
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    let _ = rewriter.write(html.as_bytes());
-    let _ = rewriter.end();
-
-    let candidates = candidates.lock().unwrap();
-
-    let normalize_base = |s: &str| -> String {
-        s.to_lowercase().replace("ú", "u").replace("ů", "u")
-    };
-
-    let strip_whitespace = |s: &str| -> String {
-        s.chars().filter(|c| !c.is_whitespace()).collect()
-    };
-
-    let normalize_strict = |s: &str| -> String {
-        strip_whitespace(&normalize_base(s))
-    };
-
-    let normalize_loose = |s: &str| -> String {
-        let base = normalize_base(s);
-        let suffix = if let Some(idx) = base.find("us") {
-            &base[idx..]
-        } else {
-            &base
-        };
-        strip_whitespace(suffix)
-    };
-
-    let query_strict = normalize_strict(query);
-    let query_loose = normalize_loose(query);
-
-    info!(
-        "Looking for query: '{}'. Strict: '{}', Loose: '{}'",
-        query, query_strict, query_loose
-    );
-
-    for (href, text) in candidates.iter() {
-        let text_strict = normalize_strict(text);
-
-        if text_strict.starts_with(&query_strict) {
-            let remainder = &text_strict[query_strict.len()..];
-
-            if remainder.is_empty() || !remainder.chars().next().unwrap().is_alphanumeric() {
-                return Some(href.clone());
-            }
-        }
-    }
-
-    for (href, text) in candidates.iter() {
-        let text_loose = normalize_loose(text);
-
-        if !query_loose.is_empty() && text_loose.starts_with(&query_loose) {
-             let remainder = &text_loose[query_loose.len()..];
-             if remainder.is_empty() || !remainder.chars().next().unwrap().is_alphanumeric() {
-                 info!("Found loose match for '{}': '{}'", query, text);
-                 return Some(href.clone());
-             }
-        }
-    }
-
-    None
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum MetaField {
-    Ecli,
-    Datum,
-    PopularTitle,
-}
-
-fn extract_metadata(html: &str) -> (String, String, String) {
-    let next_capture = Arc::new(Mutex::new(None::<MetaField>));
-    let current_capture = Arc::new(Mutex::new(None::<MetaField>));
-    let results = Arc::new(Mutex::new((String::new(), String::new(), String::new())));
-
-    let next_capture_c = next_capture.clone();
-    let next_capture_c2 = next_capture.clone();
-    let current_capture_c = current_capture.clone();
-    let current_capture_c2 = current_capture.clone();
-    let results_c = results.clone();
-
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![
-                element!("table.recordCardTable td", move |_| {
-                    let mut next = next_capture_c.lock().unwrap();
-                    let mut curr = current_capture_c.lock().unwrap();
-                    *curr = next.take();
-                    Ok(())
-                }),
-                text!("table.recordCardTable td", move |t| {
-                    let text = t.as_str();
-                    let curr = *current_capture_c2.lock().unwrap();
-                    match curr {
-                        Some(MetaField::Ecli) => results_c.lock().unwrap().0.push_str(text),
-                        Some(MetaField::Datum) => results_c.lock().unwrap().1.push_str(text),
-                        Some(MetaField::PopularTitle) => results_c.lock().unwrap().2.push_str(text),
-                        None => {}
-                    }
-                    if text.contains("Identifikátor evropské judikatury") {
-                        *next_capture_c2.lock().unwrap() = Some(MetaField::Ecli);
-                    } else if text.contains("Datum rozhodnutí") {
-                        *next_capture_c2.lock().unwrap() = Some(MetaField::Datum);
-                    } else if text.contains("Populární název") {
-                        *next_capture_c2.lock().unwrap() = Some(MetaField::PopularTitle);
-                    }
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    let _ = rewriter.write(html.as_bytes());
-    let _ = rewriter.end();
-
-    let guard = results.lock().unwrap();
-    let raw_datum = guard.1.trim().to_string();
-    let clean_datum = raw_datum.replace("Forma rozhodnutí", "").trim().to_string();
-
-    (
-        guard.0.trim().to_string(),
-        clean_datum,
-        guard.2.trim().to_string(),
-    )
-}
-
-fn has_show_abstrakt(html: &str) -> bool {
-    let found = Arc::new(Mutex::new(false));
-    let found_c = found.clone();
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![element!("input[name='ShowAbstrakt']", move |_| {
-                *found_c.lock().unwrap() = true;
-                Ok(())
-            })],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    let _ = rewriter.write(html.as_bytes());
-    let _ = rewriter.end();
-    let result = *found.lock().unwrap();
-    result
-}
-
-fn extract_abstrakt_content(html: &str) -> (String, String) {
-    let abstract_text = Arc::new(Mutex::new(String::new()));
-    let legal_text = Arc::new(Mutex::new(String::new()));
-
-    let abstract_text_c = abstract_text.clone();
-    let legal_text_c = legal_text.clone();
-
-    let abstract_text_br = abstract_text.clone();
-    let legal_text_br = legal_text.clone();
-
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![
-                text!(".abstractContent", move |t| {
-                    abstract_text_c.lock().unwrap().push_str(t.as_str());
-                    Ok(())
-                }),
-                text!(".legalSentenceContent", move |t| {
-                    legal_text_c.lock().unwrap().push_str(t.as_str());
-                    Ok(())
-                }),
-                element!(".abstractContent br", move |_| {
-                    abstract_text_br.lock().unwrap().push_str("<br>");
-                    Ok(())
-                }),
-                element!(".legalSentenceContent br", move |_| {
-                    legal_text_br.lock().unwrap().push_str("<br>");
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-    let _ = rewriter.write(html.as_bytes());
-    let _ = rewriter.end();
-
-    let raw_abs = abstract_text.lock().unwrap().trim().to_string();
-    let raw_legal = legal_text.lock().unwrap().trim().to_string();
-
-    let final_abs = if raw_abs.contains("Abstrakt není k dispozici") {
-        String::new()
-    } else {
-        raw_abs
-    };
-    let final_legal = if raw_legal.contains("Právní věta není k dispozici") {
-        String::new()
-    } else {
-        raw_legal
-    };
-
-    (final_abs, final_legal)
 }
