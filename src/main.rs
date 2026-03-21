@@ -177,7 +177,8 @@ impl AppState {
         let http_client = Arc::new(create_client()?);
 
         let db_client = if let Ok(database_url) = env::var("DATABASE_URL") {
-            info!("Connecting to database...");
+            let masked_url = database_url.split('@').last().unwrap_or("unknown");
+            info!("Connecting to database at {}...", masked_url);
             let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
                 .await
                 .map_err(|e| format!("Failed to connect to database: {}", e))?;
