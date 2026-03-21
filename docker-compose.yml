@@ -9,16 +9,22 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "8080:8080"
+    env_file:
+      - .env
     environment:
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
-      - PORT=3000
+      - PORT=8080
       - RUST_LOG=info
+      - DATABASE_URL=postgres://postgres:postgres@db:5432/pravnianalyza?sslmode=disable
+    volumes:
+      - /root/_LOGS/scraper:/app/_LOGS/scraper
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
