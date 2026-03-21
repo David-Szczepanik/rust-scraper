@@ -70,6 +70,7 @@ pub async fn scrape_nejvyssi(
             pravni_veta: metadata.pravni_veta,
             kategorie: Some(metadata.kategorie),
             text_dokumentu: metadata.text_dokumentu,
+            found_in_db: false,
         })
     } else {
         warn!("Case not found: {}", search_query);

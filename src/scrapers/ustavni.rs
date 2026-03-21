@@ -16,34 +16,50 @@ pub async fn scrape_ustavni(
 
     // 1. fetch search page
     let initial_html = client.get(&search_url).send().await?.text().await?;
-    let mut form_data = extract_hidden_fields(&initial_html)?;
+    let form_data = extract_hidden_fields(&initial_html)?;
 
-    // 2. submit search
-    info!("Submitting search for '{}' with {} form fields", search_query, form_data.len());
-    form_data.insert(
-        "ctl00$MainContent$citace".to_string(),
-        search_query.to_string(),
-    );
-    form_data.insert("ctl00$MainContent$nalezy".to_string(), "on".to_string());
-    form_data.insert("ctl00$MainContent$usneseni".to_string(), "on".to_string());
-    form_data.insert(
-        "ctl00$MainContent$but_search".to_string(),
-        "Vyhledat".to_string(),
-    );
+    // Get year variants (e.g. 10 and 2010)
+    let variants = crate::models::get_year_variants(search_query);
 
-    let response = client.post(&search_url).form(&form_data).send().await?;
-    let status = response.status();
-    let result_page_html = response.text().await?;
-    info!("Search request for '{}' returned status: {}, content length: {} bytes", search_query, status, result_page_html.len());
+    let mut status_code = reqwest::StatusCode::OK;
+    let mut final_target_href = String::new();
+    let mut final_found_citation = String::new();
 
-    // 3. find detail link
-    let (target_href, found_citation) = find_result_href(&result_page_html, search_query).ok_or_else(|| {
-        let msg = format!("Link not found for {}. Status: {}", search_query, status);
-        Box::<dyn std::error::Error + Send + Sync>::from(msg)
-    })?;
+    for query in variants {
+        // 2. submit search
+        info!("Submitting search for '{}' with {} form fields", query, form_data.len());
+        let mut form_data_clone = form_data.clone();
+        form_data_clone.insert(
+            "ctl00$MainContent$citace".to_string(),
+            query.clone(),
+        );
+        form_data_clone.insert("ctl00$MainContent$nalezy".to_string(), "on".to_string());
+        form_data_clone.insert("ctl00$MainContent$usneseni".to_string(), "on".to_string());
+        form_data_clone.insert("ctl00$MainContent$stanoviska_plena".to_string(), "on".to_string());
+        form_data_clone.insert(
+            "ctl00$MainContent$but_search".to_string(),
+            "Vyhledat".to_string(),
+        );
 
+        let response = client.post(&search_url).form(&form_data_clone).send().await?;
+        status_code = response.status();
+        let result_page_html = response.text().await?;
+        info!("Search request for '{}' returned status: {}, content length: {} bytes", query, status_code, result_page_html.len());
 
-    let detail_url = format!("{}/{}", BASE_URL, target_href);
+        // 3. find detail link
+        if let Some((target_href, found_citation)) = find_result_href(&result_page_html, &query) {
+            final_target_href = target_href;
+            final_found_citation = found_citation;
+            break;
+        }
+    }
+
+    if final_target_href.is_empty() {
+        let msg = format!("Link not found for variants of {}. Last status: {}", search_query, status_code);
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(msg));
+    }
+
+    let detail_url = format!("{}/{}", BASE_URL, final_target_href);
 
     // 4. fetch detail page
     let detail_html = client.get(&detail_url).send().await?.text().await?;
@@ -82,7 +98,7 @@ pub async fn scrape_ustavni(
 
     Ok(CaseResult {
         soud: vec!["ustavni".to_string()],
-        spisova_znacka: standardize_spisova_znacka(&found_citation),
+        spisova_znacka: standardize_spisova_znacka(&final_found_citation),
         ecli,
         datum_rozhodnuti: datum,
         popularni_nazev: Some(popularni_nazev),
@@ -91,6 +107,7 @@ pub async fn scrape_ustavni(
         pravni_veta,
         kategorie: None,
         text_dokumentu,
+        found_in_db: false,
     })
 }
 
@@ -202,7 +219,7 @@ fn find_result_href(html: &str, query: &str) -> Option<(String, String)> {
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
-                element!("a.resultData0", move |el| {
+                element!("a.resultData0, a.resultData1", move |el| {
                     let href = el.get_attribute("href").unwrap_or_default();
                     candidates_clone_el
                         .lock()
@@ -210,7 +227,7 @@ fn find_result_href(html: &str, query: &str) -> Option<(String, String)> {
                         .push((href, String::new()));
                     Ok(())
                 }),
-                text!("a.resultData0", move |t| {
+                text!("a.resultData0, a.resultData1", move |t| {
                     if let Some(last) = candidates_clone_text.lock().unwrap().last_mut() {
                         last.1.push_str(t.as_str());
                     }
@@ -232,10 +249,12 @@ fn find_result_href(html: &str, query: &str) -> Option<(String, String)> {
     }
 
     let normalize_base = |s: &str| -> String {
-        s.to_lowercase()
+        let base = s.to_lowercase()
             .replace("ú", "u")
             .replace("ů", "u")
-            .replace(".", "")
+            .replace(".", "");
+        
+        crate::models::expand_year(&base)
     };
 
     let strip_whitespace = |s: &str| -> String {
@@ -259,7 +278,7 @@ fn find_result_href(html: &str, query: &str) -> Option<(String, String)> {
     );
 
     if candidates.is_empty() {
-        warn!("No candidates found with 'a.resultData0' selector. HTML length: {} bytes", html.len());
+        warn!("No candidates found with resultData selectors. HTML length: {} bytes", html.len());
         if html.len() > 500 {
             debug!("HTML snippet: {}", &html[..500]);
         }
@@ -436,3 +455,138 @@ fn extract_abstrakt_content(html: &str) -> (String, String) {
 
     (final_abs, final_legal)
 }
+
+fn find_all_result_hrefs(html: &str) -> Vec<(String, String)> {
+    let candidates = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let candidates_el = candidates.clone();
+    let candidates_text = candidates.clone();
+
+    let mut rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: vec![
+                element!("a.resultData0, a.resultData1", move |el| {
+                    let href = el.get_attribute("href").unwrap_or_default();
+                    candidates_el.lock().unwrap().push((href, String::new()));
+                    Ok(())
+                }),
+                text!("a.resultData0, a.resultData1", move |t| {
+                    if let Some(last) = candidates_text.lock().unwrap().last_mut() {
+                        last.1.push_str(t.as_str());
+                    }
+                    Ok(())
+                }),
+            ],
+            ..Settings::default()
+        },
+        |_: &[u8]| {},
+    );
+    let _ = rewriter.write(html.as_bytes());
+    let _ = rewriter.end();
+
+    let result = candidates.lock().unwrap().clone();
+    result
+}
+
+pub async fn fetch_case_detail(
+    client: &Client,
+    href: &str,
+    citation: &str,
+) -> Result<CaseResult, Box<dyn std::error::Error + Send + Sync>> {
+    let detail_url = format!("{}/{}", BASE_URL, href);
+
+    let detail_html = client.get(&detail_url).send().await?.text().await?;
+    let (ecli, datum, popularni_nazev) = extract_metadata(&detail_html);
+    let text_dokumentu = extract_document_text(&detail_html);
+
+    let (mut abstrakt, mut pravni_veta) = if has_show_abstrakt(&detail_html) {
+        let parsed_url = Url::parse(&detail_url)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let id_param = parsed_url
+            .query_pairs()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v.to_string())
+            .ok_or("Could not find 'id' parameter in detail URL")?;
+
+        let abstrakt_url = format!("{}/Abstrakt.aspx?id={}", BASE_URL, id_param);
+        let abstrakt_html = client.get(&abstrakt_url).send().await?.text().await?;
+        extract_abstrakt_content(&abstrakt_html)
+    } else {
+        (String::new(), String::new())
+    };
+
+    let ecli = html_escape::decode_html_entities(ecli.trim()).into_owned();
+    let datum = html_escape::decode_html_entities(datum.trim()).into_owned();
+    let mut pop_nazev = html_escape::decode_html_entities(popularni_nazev.trim()).into_owned();
+    let text_dokumentu = html_escape::decode_html_entities(text_dokumentu.trim()).into_owned();
+    abstrakt = html_escape::decode_html_entities(abstrakt.trim()).into_owned();
+    pravni_veta = html_escape::decode_html_entities(pravni_veta.trim()).into_owned();
+
+    if pop_nazev.trim().is_empty() {
+        pop_nazev = String::new();
+    }
+
+    Ok(CaseResult {
+        soud: vec!["ustavni".to_string()],
+        spisova_znacka: standardize_spisova_znacka(citation),
+        ecli,
+        datum_rozhodnuti: datum,
+        popularni_nazev: Some(pop_nazev),
+        url_adresa: detail_url,
+        abstrakt: Some(abstrakt),
+        pravni_veta,
+        kategorie: None,
+        text_dokumentu,
+        found_in_db: false,
+    })
+}
+
+/// Search Ustavni court and return citations/hrefs without fetching details yet.
+pub async fn search_ustavni_citations(
+    client: &Client,
+    phrases: &[String],
+    keywords: &[String],
+) -> Result<(HashMap<String, Vec<(String, String)>>, HashMap<String, Vec<(String, String)>>), Box<dyn std::error::Error + Send + Sync>> {
+    let search_url = format!("{}/Search.aspx", BASE_URL);
+    let mut keyword_citations = HashMap::new();
+    let mut phrase_citations = HashMap::new();
+
+    let initial_html = client.get(&search_url).send().await?.text().await?;
+    let base_form_data = extract_hidden_fields(&initial_html)?;
+
+    for keyword in keywords {
+        if keyword.trim().is_empty() { continue; }
+        let mut form_data = base_form_data.clone();
+        form_data.insert("ctl00$MainContent$popularni_nazev".to_string(), keyword.clone());
+        form_data.insert("ctl00$MainContent$nalezy".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$usneseni".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$stanoviska_plena".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$resultsPageSize".to_string(), "20".to_string());
+        form_data.insert("ctl00$MainContent$but_search".to_string(), "Vyhledat".to_string());
+
+        let result_html = client.post(&search_url).form(&form_data).send().await?.text().await?;
+        let hrefs = find_all_result_hrefs(&result_html);
+        info!("Keyword '{}' found {} citations", keyword, hrefs.len());
+        keyword_citations.insert(keyword.clone(), hrefs);
+    }
+
+    for phrase in phrases {
+        if phrase.trim().is_empty() { continue; }
+        let mut form_data = base_form_data.clone();
+        form_data.insert("ctl00$MainContent$text".to_string(), phrase.clone());
+        form_data.insert("ctl00$MainContent$nalezy".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$usneseni".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$stanoviska_plena".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$pravni_veta".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$abstrakt".to_string(), "on".to_string());
+        form_data.insert("ctl00$MainContent$resultsPageSize".to_string(), "20".to_string());
+        form_data.insert("ctl00$MainContent$but_search".to_string(), "Vyhledat".to_string());
+
+        let result_html = client.post(&search_url).form(&form_data).send().await?.text().await?;
+        let hrefs = find_all_result_hrefs(&result_html);
+        info!("Phrase '{}' found {} citations", phrase, hrefs.len());
+        phrase_citations.insert(phrase.clone(), hrefs);
+    }
+
+    Ok((keyword_citations, phrase_citations))
+}
+

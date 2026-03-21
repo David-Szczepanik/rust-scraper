@@ -37,7 +37,14 @@ pub async fn scrape_nejvyssi_spravni(
     client: &Client,
     search_query: &str,
 ) -> Result<CaseResult, Box<dyn std::error::Error + Send + Sync>> {
-    info!("Scraping Supreme Administrative Court (NSS) for: {}", search_query);
+    // Truncate search query if it contains " - " (usually indicates page number like "1 As 118/2012 - 41")
+    let cleaned_query = if let Some(pos) = search_query.find(" - ") {
+        search_query[..pos].trim()
+    } else {
+        search_query.trim()
+    };
+
+    info!("Scraping Supreme Administrative Court (NSS) for: {} (cleaned: {})", search_query, cleaned_query);
 
     // 1. Get the search page to capture all hidden form fields (including __RequestVerificationToken)
     let search_page_url = "https://vyhledavac.nssoud.cz/";
@@ -49,7 +56,7 @@ pub async fn scrape_nejvyssi_spravni(
     // Using the field name for full case number 'Označení věci v celku'
     form_data.insert(
         "vyhledavaciSekce[0].vyhledavaciPodminka[1].vyhledavaciPodminkaHodnota[0].HodnotaText".to_string(),
-        search_query.to_string()
+        cleaned_query.to_string()
     );
     
     // Ensure "Formular" is "1"
@@ -88,7 +95,7 @@ pub async fn scrape_nejvyssi_spravni(
 
         Ok(CaseResult {
             soud: vec!["nejvyssi_spravni".to_string(), metadata.soud_senat],
-            spisova_znacka: search_query.to_string(),
+            spisova_znacka: cleaned_query.to_string(),
             ecli: metadata.ecli,
             datum_rozhodnuti: metadata.datum,
             popularni_nazev: None,
@@ -97,6 +104,7 @@ pub async fn scrape_nejvyssi_spravni(
             pravni_veta: metadata.pravni_veta,
             kategorie: None,
             text_dokumentu: clean_text,
+            found_in_db: false,
         })
     } else {
         warn!("NSS case not found: {}", search_query);

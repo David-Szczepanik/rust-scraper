@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
-use hash_ids::HashIds;
-use tracing::info;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CaseResult {
     pub spisova_znacka: String,
     pub ecli: String,
@@ -14,70 +12,31 @@ pub struct CaseResult {
     pub pravni_veta: String,
     pub kategorie: Option<String>,
     pub text_dokumentu: String,
+    #[serde(default)]
+    pub found_in_db: bool,
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+pub enum LogResult {
+    Scraped(CaseResult),
+    InDatabase {
+        spisova_znacka: String,
+        found_in_db: bool,
+    },
+}
+
+#[derive(Serialize, Clone)]
 pub struct ScrapedCase {
     pub spisova_znacka: String,
-    pub kategorie: Option<String>,
-    pub text_dokumentu: String,
 }
 
 impl From<CaseResult> for ScrapedCase {
     fn from(c: CaseResult) -> Self {
         Self {
             spisova_znacka: c.spisova_znacka,
-            kategorie: c.kategorie.clone(),
-            text_dokumentu: c.text_dokumentu,
         }
     }
-}
-
-// judikatura table
-#[derive(Serialize)]
-pub struct DbCase {
-    pub jud_id: String,
-    pub spisova_znacka: String,
-    pub ecli: String,
-    pub datum_rozhodnuti: String,
-    pub popularni_nazev: Option<String>,
-    pub soud: Vec<String>,
-    pub url_adresa: String,
-    pub abstrakt: Option<String>,
-    pub pravni_veta: String,
-    pub kategorie: Option<String>,
-    pub text_dokumentu: String,
-}
-
-impl From<CaseResult> for DbCase {
-    fn from(c: CaseResult) -> Self {
-        Self {
-            jud_id: generate_jud_id(&c.spisova_znacka),
-            spisova_znacka: c.spisova_znacka,
-            ecli: c.ecli,
-            datum_rozhodnuti: c.datum_rozhodnuti,
-            popularni_nazev: c.popularni_nazev.clone(),
-            soud: c.soud.clone(),
-            url_adresa: c.url_adresa,
-            abstrakt: c.abstrakt.clone(),
-            pravni_veta: c.pravni_veta,
-            kategorie: c.kategorie,
-            text_dokumentu: c.text_dokumentu,
-        }
-    }
-}
-
-pub fn generate_jud_id(spisova_znacka: &str) -> String {
-    let clean_znacka = spisova_znacka.trim();
-    info!(
-        "Looking for query: '{}'",
-        clean_znacka
-    );
-    let hasher = HashIds::builder()
-        .with_salt(clean_znacka)
-        .with_min_length(8)
-        .finish();
-    hasher.encode(&[1])
 }
 
 #[derive(Deserialize, Debug)]
@@ -87,13 +46,31 @@ pub struct ScrapeRequest {
     pub nejvyssi: Option<Vec<String>>,
     pub nejvyssi_spravni: Option<Vec<String>>,
     pub debug_mode: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SearchRequest {
+    pub task_id: String,
+    pub courts: Option<Vec<String>>,
+    pub phrases: Option<Vec<String>>,
+    pub keywords: Option<Vec<String>>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct CourtResults {
+    pub keywords: std::collections::HashMap<String, Vec<ScrapedCase>>,
+    pub phrases: std::collections::HashMap<String, Vec<ScrapedCase>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<ScrapedCase>,
 }
 
 #[derive(Serialize)]
 pub struct ScrapeResponse {
     pub task_id: String,
     pub scraped_count: usize,
-    pub results: Vec<ScrapedCase>,
+    pub results: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -101,7 +78,7 @@ pub struct ScrapeLog {
     pub success: bool,
     pub task_id: String,
     pub scraped_count: usize,
-    pub results: Vec<CaseResult>,
+    pub results: Vec<LogResult>,
     pub failed_cases: std::collections::HashMap<String, String>,
     pub message: String,
 }
@@ -110,4 +87,46 @@ pub struct ScrapeLog {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+}
+
+pub fn expand_year(input: &str) -> String {
+    let mut result = input.to_string();
+    if let Some(pos) = result.rfind('/') {
+        let after_slash = &result[pos + 1..];
+        let trimmed = after_slash.trim();
+        if trimmed == "00" {
+            if let Some(digit_pos) = after_slash.find(|c: char| c.is_ascii_digit()) {
+                result.insert_str(pos + 1 + digit_pos, "20");
+            }
+        }
+    }
+    result
+}
+
+pub fn get_year_variants(input: &str) -> Vec<String> {
+    let mut result = vec![input.to_string()];
+    
+    if let Some(pos) = input.rfind('/') {
+        let after_slash = input[pos + 1..].trim();
+        let digits: String = after_slash.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let rest: String = after_slash.chars().skip(digits.len()).collect();
+        
+        if digits.len() == 2 {
+            let year = digits.parse::<u32>().unwrap_or(0);
+            let century = if year > 50 { 1900 } else { 2000 };
+            let full_year = century + year;
+            let expanded_str = format!("{}/{}{}", &input[..pos], full_year, rest);
+            if !result.contains(&expanded_str) {
+                result.push(expanded_str);
+            }
+        } else if digits.len() == 4 {
+            let short_year = &digits[2..];
+            let short_str = format!("{}/{}{}", &input[..pos], short_year, rest);
+            if !result.contains(&short_str) {
+                result.push(short_str);
+            }
+        }
+    }
+    
+    result
 }

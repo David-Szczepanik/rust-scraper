@@ -32,11 +32,10 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Supabase/Postgres
-postgrest = "1.6"
+# Postgres
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 
 # Date and Time
 chrono = "0.4"
-hash-ids = "0.3.1"
 urlencoding = "2.1.3"
 html-escape = "0.2.13"

@@ -1,0 +1,104 @@
+    Checking rust-scraper v0.1.0 (C:\DEV\rust\rust-scraper)
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_keyword`
+   --> src\main.rs:369:17
+    |
+369 |                 by_keyword: None,
+    |                 ^^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_phrase`
+   --> src\main.rs:370:17
+    |
+370 |                 by_phrase: None,
+    |                 ^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_keyword`
+   --> src\main.rs:509:9
+    |
+509 |         by_keyword: None,
+    |         ^^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_phrase`
+   --> src\main.rs:510:9
+    |
+510 |         by_phrase: None,
+    |         ^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_keyword`
+   --> src\main.rs:565:17
+    |
+565 |                 by_keyword: None,
+    |                 ^^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_phrase`
+   --> src\main.rs:566:17
+    |
+566 |                 by_phrase: None,
+    |                 ^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0277]: the trait bound `models::ScrapedCase: Clone` is not satisfied
+  --> src\models.rs:53:5
+   |
+51 | #[derive(Serialize, Default, Clone)]
+   |                              ----- in this derive macro expansion
+52 | pub struct CourtResults {
+53 |     pub keywords: std::collections::HashMap<String, Vec<ScrapedCase>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `models::ScrapedCase`
+   |
+   = note: required for `Vec<models::ScrapedCase>` to implement `Clone`
+   = note: 1 redundant requirement hidden
+   = note: required for `HashMap<std::string::String, Vec<models::ScrapedCase>>` to implement `Clone`
+help: consider annotating `models::ScrapedCase` with `#[derive(Clone)]`
+   |
+18 + #[derive(Clone)]
+19 | pub struct ScrapedCase {
+   |
+
+error[E0277]: the trait bound `models::ScrapedCase: Clone` is not satisfied
+  --> src\models.rs:54:5
+   |
+51 | #[derive(Serialize, Default, Clone)]
+   |                              ----- in this derive macro expansion
+...
+54 |     pub phrases: std::collections::HashMap<String, Vec<ScrapedCase>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `models::ScrapedCase`
+   |
+   = note: required for `Vec<models::ScrapedCase>` to implement `Clone`
+   = note: 1 redundant requirement hidden
+   = note: required for `HashMap<std::string::String, Vec<models::ScrapedCase>>` to implement `Clone`
+help: consider annotating `models::ScrapedCase` with `#[derive(Clone)]`
+   |
+18 + #[derive(Clone)]
+19 | pub struct ScrapedCase {
+   |
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_keyword`
+   --> src\main.rs:231:13
+    |
+231 |             by_keyword: None,
+    |             ^^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+error[E0560]: struct `models::ScrapeResponse` has no field named `by_phrase`
+   --> src\main.rs:232:13
+    |
+232 |             by_phrase: None,
+    |             ^^^^^^^^^ `models::ScrapeResponse` does not have this field
+    |
+    = note: available fields are: `ustavni`, `nejvyssi`, `nejvyssi_spravni`
+
+Some errors have detailed explanations: E0277, E0560.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `rust-scraper` (bin "rust-scraper") due to 10 previous errors
