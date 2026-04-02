@@ -213,6 +213,10 @@ async fn scrape_handler(
     State(state): State<AppState>,
     Json(payload): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<ScrapeResponse>) {
+    let start_time = std::time::Instant::now();
+    let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    info!("Received scrape request:\n{}", payload_json);
+
     let is_debug: bool = payload.debug_mode.unwrap_or(false) || env::var("DEBUG") == Ok("1".to_string());
     let scrape_limit = payload.limit.unwrap_or(5);
 
@@ -402,6 +406,7 @@ async fn scrape_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     };
 
+    info!("Scrape handler completed in {:?}", start_time.elapsed());
     (status, Json(response))
 }
 
@@ -410,6 +415,10 @@ async fn search_handler(
     State(state): State<AppState>,
     Json(payload): Json<SearchRequest>,
 ) -> (StatusCode, Json<ScrapeResponse>) {
+    let start_time = std::time::Instant::now();
+    let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
+    info!("Received search request:\n{}", payload_json);
+
     let phrases: Vec<String> = payload.phrases.as_ref().map(|v| v.iter())
         .unwrap_or_default()
         .filter(|s| !s.trim().is_empty())
@@ -695,6 +704,7 @@ async fn search_handler(
         results: grouped_results,
     };
 
+    info!("Search handler completed in {:?}", start_time.elapsed());
     (status, Json(response))
 }
 

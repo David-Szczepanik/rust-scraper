@@ -89,18 +89,19 @@ pub struct HealthResponse {
     pub version: String,
 }
 
+/// Normalizes a year after the last '/' to its 2-digit short form so that
+/// "3063/20", "3063/2020", and "3063/20 #1" all compare equal after normalization.
 pub fn expand_year(input: &str) -> String {
-    let mut result = input.to_string();
-    if let Some(pos) = result.rfind('/') {
-        let after_slash = &result[pos + 1..];
-        let trimmed = after_slash.trim();
-        if trimmed == "00" {
-            if let Some(digit_pos) = after_slash.find(|c: char| c.is_ascii_digit()) {
-                result.insert_str(pos + 1 + digit_pos, "20");
-            }
+    if let Some(pos) = input.rfind('/') {
+        let after_slash = input[pos + 1..].trim_start();
+        let digits: String = after_slash.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() == 4 {
+            let short = &digits[2..];
+            let rest = &after_slash[digits.len()..];
+            return format!("{}/{}{}", &input[..pos], short, rest);
         }
     }
-    result
+    input.to_string()
 }
 
 pub fn get_year_variants(input: &str) -> Vec<String> {
