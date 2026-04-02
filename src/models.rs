@@ -39,7 +39,7 @@ impl From<CaseResult> for ScrapedCase {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ScrapeRequest {
     pub task_id: String,
     pub ustavni: Option<Vec<String>>,
@@ -49,7 +49,7 @@ pub struct ScrapeRequest {
     pub limit: Option<usize>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SearchRequest {
     pub task_id: String,
     pub courts: Option<Vec<String>>,
