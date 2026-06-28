@@ -209,7 +209,8 @@ fn extract_nss_metadata(detail_html: &str) -> NssMetadata {
                             meta.heslo.push_str(", ");
                         }
                         meta.heslo.push_str(content);
-                    } else if label == "pravnivetaupravena" || label == "pravnivetaan" {
+                    } else if label == "pravnivetaupravena" {
+                        // Only capture the "(text)" version, not the plain "Ano" version
                         meta.pravni_veta.push_str(content);
                     }
                     Ok(())
