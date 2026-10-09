@@ -1,3 +1,5 @@
+mod common;
+pub use common::BoxError;
 pub mod ustavni;
 pub mod nejvyssi;
 pub mod nejvyssi_spravni;

@@ -1,0 +1,60 @@
+name: 📖 API docs
+
+# Publishes openapi.json as a Redoc page on GitHub Pages
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'openapi.json'
+      - '.github/workflows/api-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🦀 Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Fails when the committed openapi.json no longer matches the code
+      - name: 🔍 Check openapi.json is up to date
+        run: cargo test openapi
+
+      - name: 🏗️ Build Redoc page
+        run: |
+          mkdir site
+          npx --yes @redocly/cli@2.62.1 build-docs openapi.json --output site/index.html
+          cp openapi.json site/
+
+      - name: 📦 Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

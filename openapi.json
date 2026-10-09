@@ -1,0 +1,366 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "rust-scraper",
+    "description": "Fetches Czech court decisions by case number or search term and stores them in PostgreSQL.",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local `cargo run`"
+    }
+  ],
+  "paths": {
+    "/cases": {
+      "post": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Fetch cases by case number",
+        "description": "Scrapes up to `limit` cases per court (only the first one in debug mode) and stores them.\nCases already in the database are not scraped again. Database lookup ignores accents,\nspaces, dots and letter case, and accepts a prefix match, so `Pl. ÚS 19/93` matches\na stored `Pl.US19/93#1`.",
+        "operationId": "scrape_handler",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScrapeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every case succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "Some cases failed, see `failed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No case numbers given",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every case failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cases/search": {
+      "get": {
+        "tags": [
+          "cases"
+        ],
+        "summary": "Search cases by phrase or keyword",
+        "description": "Only the Constitutional Court (`ustavni`) has a real full-text search, returning up to\n`limit` hits per term. For `nejvyssi` and `nejvyssi_spravni`, each term is treated as a\ncase number and scraped directly. Cases found are stored like in `POST /cases`.",
+        "operationId": "search_handler",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "query",
+            "description": "Caller's id for this request, echoed back and written to the log.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "court",
+            "in": "query",
+            "description": "Court key to search in: `ustavni`, `nejvyssi` or `nejvyssi_spravni`. Required, repeatable.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "phrase",
+            "in": "query",
+            "description": "Phrase to search for. Repeatable.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "description": "Keyword to search for. Repeatable. At least one phrase or keyword is required.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of hits per term. Default 5.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every court succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "Some courts failed, see `failed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No court, no search term, or an unknown court",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every court failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CasesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness check",
+        "operationId": "health_handler",
+        "responses": {
+          "200": {
+            "description": "The service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CasesResponse": {
+        "type": "object",
+        "description": "Case numbers found, grouped by court key, and the failures.",
+        "required": [
+          "scraped_count",
+          "results",
+          "failed"
+        ],
+        "properties": {
+          "failed": {
+            "type": "object",
+            "description": "Case number (or court, for search) -> error message.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": {
+              "1 As 100/2020": "Case not found"
+            }
+          },
+          "results": {
+            "type": "object",
+            "description": "Court key -> case numbers.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": {
+              "nejvyssi": [
+                "3 Tdo 706/2024"
+              ],
+              "ustavni": [
+                "Pl. ÚS 19/93"
+              ]
+            }
+          },
+          "scraped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `task_id` from the request, if one was given.",
+            "example": "123"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Body of every 4xx response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "example": "no court given"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "version"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "ScrapeRequest": {
+        "type": "object",
+        "description": "Case numbers to fetch, per court. Each court list is optional.",
+        "properties": {
+          "debug_mode": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Takes only the first case per court. Also on when the `DEBUG` env var is `1`."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Maximum number of cases taken from each court list. Default 5.",
+            "example": 5,
+            "minimum": 0
+          },
+          "nejvyssi": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Supreme Court case numbers.",
+            "example": [
+              "3 Tdo 706/2024"
+            ]
+          },
+          "nejvyssi_spravni": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Supreme Administrative Court case numbers.",
+            "example": [
+              "1 As 100/2020"
+            ]
+          },
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Caller's id for this request, echoed back and written to the log.",
+            "example": "123"
+          },
+          "ustavni": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Constitutional Court case numbers.",
+            "example": [
+              "Pl. ÚS 19/93"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
